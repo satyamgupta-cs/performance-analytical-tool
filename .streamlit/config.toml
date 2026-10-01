@@ -1,0 +1,11 @@
+[theme]
+# A modern, professional SaaS color palette
+primaryColor = "#2563EB"            # Royal Blue for primary actions
+backgroundColor = "#F8FAFC"         # Very subtle cool-gray background
+secondaryBackgroundColor = "#FFFFFF"  # Crisp white for the sidebar and containers
+textColor = "#0F172A"               # Slate dark gray for readable text
+font = "sans serif"
+
+[client]
+showErrorDetails = false            # Hides ugly python tracebacks from regular users
+toolbarMode = "minimal"             # Hides the Streamlit developer toolbar

@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+.env
+database/db_config.json
+app_database.db
+.venv/
+*.egg-info/

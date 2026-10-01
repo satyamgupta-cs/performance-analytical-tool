@@ -1,0 +1,10 @@
+streamlit
+pandas
+plotly
+scipy
+sqlalchemy
+mysql-connector-python
+psycopg2-binary
+python-dotenv
+bcrypt
+reportlab
