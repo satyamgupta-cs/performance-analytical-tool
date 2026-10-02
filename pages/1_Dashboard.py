@@ -1,5 +1,7 @@
 import plotly.express as px
 import streamlit as st
+import pandas as pd
+from db_utils import run_query
 
 from anomaly_detection import (
     DEFAULT_ALPHA,
@@ -249,3 +251,105 @@ else:
             except Exception:
                 st.info("Go to the **Employee** page from the sidebar and search for "
                         f"ID {selected_id} ({row['name']}).")
+
+def render_risk_classification_section(df_employees: pd.DataFrame):
+    if df_employees is None or df_employees.empty:
+        st.info("No performance data found for the current month.")
+        return
+
+    df_classified = df_employees.copy()
+
+    # Classification logic based on calculated score
+    def classify_simple(score):
+        try:
+            val = float(score)
+        except (ValueError, TypeError):
+            val = 0.0
+
+        if val >= 85:
+            return "High Performer", "🟢"
+        elif val >= 70:
+            return "Watch", "🟡"
+        else:
+            return "At Risk", "🔴"
+
+    df_classified["tier_info"] = df_classified["score"].apply(classify_simple)
+    df_classified["tier"] = df_classified["tier_info"].apply(lambda x: x[0])
+
+    # Count metrics per category
+    tier_counts = df_classified["tier"].value_counts().to_dict()
+    high_perf = tier_counts.get("High Performer", 0)
+    watch = tier_counts.get("Watch", 0)
+    at_risk = tier_counts.get("At Risk", 0)
+
+    st.subheader("Employee Risk Classification Dashboard")
+
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        st.metric(label="🟢 High Performers (Score ≥ 85)", value=high_perf)
+    with col2:
+        st.metric(label="🟡 Watch / Monitor (Score 70–84)", value=watch)
+    with col3:
+        st.metric(label="🔴 At Risk (Score < 70)", value=at_risk)
+
+    st.divider()
+
+    # Category Filter
+    selected_tier = st.selectbox(
+        "Filter Category View",
+        options=["All Categories", "🟢 High Performer", "🟡 Watch", "🔴 At Risk"]
+    )
+
+    filtered_df = df_classified.copy()
+    if selected_tier != "All Categories":
+        clean_tier = selected_tier.split(" ", 1)[1] if " " in selected_tier else selected_tier
+        filtered_df = filtered_df[filtered_df["tier"] == clean_tier]
+
+    # Display Table
+    st.dataframe(
+        filtered_df[[
+            "employee_id", "name", "department", "score", "tier", 
+            "completed_tasks", "assigned_tasks", "customer_rating"
+        ]],
+        column_config={
+            "score": st.column_config.ProgressColumn(
+                "Calculated Score",
+                format="%d",
+                min_value=0,
+                max_value=100,
+            ),
+            "tier": st.column_config.TextColumn("Health Category"),
+            "completed_tasks": st.column_config.NumberColumn("Completed Tasks"),
+            "assigned_tasks": st.column_config.NumberColumn("Assigned Tasks"),
+            "customer_rating": st.column_config.NumberColumn("Customer Rating (1-5)"),
+        },
+        hide_index=True,
+        width="stretch"
+    )
+
+# Fetch latest month performance and compute score dynamically
+query = """
+SELECT 
+    e.employee_id,
+    e.name,
+    e.department,
+    p.month,
+    p.assigned_tasks,
+    p.completed_tasks,
+    p.completed_before_deadline,
+    p.working_days,
+    p.present_days,
+    p.customer_rating,
+    ROUND(
+        (COALESCE(p.completed_tasks::float / NULLIF(p.assigned_tasks, 0), 0) * 40) +
+        (COALESCE(p.present_days::float / NULLIF(p.working_days, 0), 0) * 30) +
+        (COALESCE(p.completed_before_deadline::float / NULLIF(p.completed_tasks, 0), 0) * 20) +
+        (COALESCE(p.customer_rating::float / 5.0, 0) * 10)
+    ) AS score
+FROM employees e
+JOIN performance p ON e.employee_id = p.employee_id
+WHERE p.month = (SELECT MAX(month) FROM performance)
+"""
+# Run query and render dashboard
+df_employees = run_query(query, fetch=True)
+render_risk_classification_section(df_employees)
