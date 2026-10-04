@@ -37,6 +37,7 @@ import pandas as pd
 from dotenv import load_dotenv
 from sqlalchemy import create_engine
 from sqlalchemy.engine import URL
+import streamlit as st
 
 load_dotenv()  # reads .env in the project root into os.environ, if present
 
@@ -1028,3 +1029,34 @@ def get_audit_logs_df() -> pd.DataFrame:
     df = pd.read_sql_query(query, conn)
     conn.close()
     return df
+
+def get_payslip_config():
+    """Fetches the current salary slip settings or returns default structure."""
+    df = run_query("SELECT config_value FROM app_settings WHERE config_key = 'payslip_config'", fetch=True)
+    if df is not None and not df.empty:
+        return json.loads(df.iloc[0]['config_value'])
+    
+    # Default structure fallback
+    return {
+        "Corporate": {
+            "earnings": ["Basic Salary", "HRA", "Travel Allowance", "Performance Bonus", "Special Allowance"],
+            "deductions": ["PF", "Professional Tax", "TDS"]
+        },
+        "Government": {
+            "earnings": ["Basic Salary", "HRA", "Dearness Allowance (DA)", "Medical Allowance"],
+            "deductions": ["PF", "NPS", "Professional Tax", "TDS"]
+        },
+        "Contract": {
+            "earnings": ["Basic Salary", "Overtime Pay", "Special Allowance"],
+            "deductions": ["TDS", "Other Deduction"]
+        }
+    }
+
+def save_payslip_config(config_dict):
+    """Saves updated payslip layout settings."""
+    config_json = json.dumps(config_dict)
+    run_query("""
+        INSERT INTO app_settings (config_key, config_value) 
+        VALUES ('payslip_config', %s)
+        ON CONFLICT (config_key) DO UPDATE SET config_value = EXCLUDED.config_value
+    """, (config_json,), fetch=False)

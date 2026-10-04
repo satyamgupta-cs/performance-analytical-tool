@@ -174,9 +174,19 @@ if search:
                 salary_df, spot_bonus_df, team_bonus_df, team_members_df, profit_sharing_df, referral_df,
             )
             if payslip_data:
+    # Safely extract month and year from payslip_month (e.g., "2026-03" or "03")
+                if "-" in str(payslip_month):
+                    year_val, month_val = payslip_month.split("-")
+                else:
+                    year_val, month_val = None, payslip_month
+
                 st.download_button(
                     "Download Payslip (PDF)",
-                    data=generate_payslip_pdf(payslip_data),
+                    data=generate_payslip_pdf(
+                        employee_data=payslip_data,
+                        month_str=month_val,
+                        year_str=year_val
+                    ),
                     file_name=f"payslip_{emp_id}_{payslip_month}.pdf",
                     mime="application/pdf",
                 )

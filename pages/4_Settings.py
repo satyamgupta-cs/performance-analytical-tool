@@ -1,7 +1,8 @@
 import streamlit as st
 import pandas as pd
 from ui_design import apply_modern_ui, top_profile_bar
-
+import json
+from db_utils import get_payslip_config, save_payslip_config
 from db_utils import (
     get_weights, update_weights, get_bonus_policy, update_bonus_percent,
     current_db_info, save_db_config, init_schema,
@@ -247,3 +248,56 @@ with st.form("company_settings_form"):
         )
         
         st.success("Company-wide bonus defaults updated.")
+
+st.title("⚙️ System Settings")
+
+st.subheader("💳 Salary & Payslip Component Configuration")
+st.caption("Enable or disable earnings and deduction fields per employment tier.")
+
+# Available Master Fields
+ALL_EARNINGS = [
+    "Basic Salary", "HRA", "Dearness Allowance (DA)", "Travel Allowance",
+    "Medical Allowance", "Special Allowance", "Conveyance Allowance",
+    "Performance Bonus", "Incentive", "Overtime Pay", "Shift Allowance",
+    "Night Shift Allowance", "Leave Encashment", "Arrears", "Commission", "Other Allowance"
+]
+
+ALL_DEDUCTIONS = [
+    "PF", "Professional Tax", "TDS", "ESI", "Labour Welfare Fund",
+    "Loan Recovery", "Advance Recovery", "Insurance Premium", "VPF", "NPS", "Other Deduction"
+]
+
+config = get_payslip_config()
+
+# Select Employee Category to Configure
+emp_type = st.radio("Select Employee Type to Configure:", ["Corporate", "Government", "Contract"], horizontal=True)
+
+col_earn, col_ded = st.columns(2)
+
+with col_earn:
+    st.markdown("### 🟢 Active Earnings")
+    selected_earnings = []
+    current_earnings = config.get(emp_type, {}).get("earnings", [])
+    
+    for item in ALL_EARNINGS:
+        checked = st.checkbox(item, value=(item in current_earnings), key=f"earn_{emp_type}_{item}")
+        if checked:
+            selected_earnings.append(item)
+
+with col_ded:
+    st.markdown("### 🔴 Active Deductions")
+    selected_deductions = []
+    current_deductions = config.get(emp_type, {}).get("deductions", [])
+    
+    for item in ALL_DEDUCTIONS:
+        checked = st.checkbox(item, value=(item in current_deductions), key=f"ded_{emp_type}_{item}")
+        if checked:
+            selected_deductions.append(item)
+
+if st.button("Save Salary Component Configuration", type="primary"):
+    config[emp_type] = {
+        "earnings": selected_earnings,
+        "deductions": selected_deductions
+    }
+    save_payslip_config(config)
+    st.success(f"Payslip setup for {emp_type} saved successfully!")
