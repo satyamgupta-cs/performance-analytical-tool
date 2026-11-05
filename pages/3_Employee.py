@@ -63,7 +63,7 @@ if search:
         emp_id = int(emp["employee_id"])
 
         # Fetch Department Standings
-        df_rankings = get_all_performance_with_standing()
+        df_rankings = get_all_performance_with_standing(weights)
         standing_val = "Standard"
         if df_rankings is not None and not df_rankings.empty:
             match = df_rankings[df_rankings["employee_id"] == emp_id]
@@ -125,7 +125,8 @@ if search:
                 completed_before_deadline=raw_data["completed_before_deadline"],
                 present_days=raw_data["present_days"],
                 working_days=raw_data["working_days"],
-                customer_rating=raw_data["customer_rating"]
+                customer_rating=raw_data["customer_rating"],
+                weights=weights,
             )
 
             with st.container(border=True):

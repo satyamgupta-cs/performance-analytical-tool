@@ -5,3 +5,10 @@ database/db_config.json
 app_database.db
 .venv/
 *.egg-info/
+AGENTS.md
+docs/
+skills-lock.json
+tests/
+my-list.txt
+agents/
+

@@ -138,11 +138,119 @@ def migrate_bonus_budgets_table():
         conn.execute(text(create_sql))
     print("bonus_budgets: table created.")
 
+
+def migrate_app_settings_table():
+    """Creates the app_settings table if it doesn't exist yet."""
+    if _existing_columns("app_settings") is not None:
+        print("app_settings: table already present.")
+        return
+
+    create_sql = (
+        "CREATE TABLE app_settings ("
+        "config_key VARCHAR(100) PRIMARY KEY, "
+        "config_value TEXT NOT NULL, "
+        "updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)"
+    )
+    with _engine.begin() as conn:
+        conn.execute(text(create_sql))
+    print("app_settings: table created.")
+
+
+def migrate_audit_logs_table():
+    """Creates the audit_logs table in PostgreSQL if it doesn't exist yet."""
+    if _existing_columns("audit_logs") is not None:
+        print("audit_logs: table already present.")
+        return
+
+    if DB_TYPE == "mysql":
+        create_sql = (
+            "CREATE TABLE audit_logs ("
+            "log_id INT PRIMARY KEY AUTO_INCREMENT, "
+            "timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP, "
+            "username VARCHAR(120) NOT NULL, "
+            "action VARCHAR(255) NOT NULL, "
+            "old_value TEXT, "
+            "new_value TEXT)"
+        )
+    else:
+        create_sql = (
+            "CREATE TABLE audit_logs ("
+            "log_id SERIAL PRIMARY KEY, "
+            "timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP, "
+            "username VARCHAR(120) NOT NULL, "
+            "action VARCHAR(255) NOT NULL, "
+            "old_value TEXT DEFAULT '—', "
+            "new_value TEXT DEFAULT '—')"
+        )
+    with _engine.begin() as conn:
+        conn.execute(text(create_sql))
+    print("audit_logs: table created.")
+
+
+def migrate_team_bonus_snapshot():
+    """Adds member_count_snapshot and member_ids_snapshot to team_bonus if missing.
+
+    These columns freeze the team headcount and recipient employee IDs at
+    award time so that future roster changes don't alter historical per-member
+    bonus shares or transfer past bonuses to new members
+    (Rank 5 — Payroll Immutability). Existing rows default to 0 / NULL, which
+    causes the calculation layer to fall back to the live roster count
+    for backward compatibility.
+    """
+    columns = _existing_columns("team_bonus")
+    if columns is None:
+        print("team_bonus: table not found — run setup_db.py for a fresh database.")
+        return
+    with _engine.begin() as conn:
+        if "member_count_snapshot" not in columns:
+            conn.execute(text(
+                "ALTER TABLE team_bonus ADD COLUMN member_count_snapshot INT NOT NULL DEFAULT 0"
+            ))
+            print("team_bonus: added member_count_snapshot column.")
+        else:
+            print("team_bonus: member_count_snapshot already present.")
+
+        if "member_ids_snapshot" not in columns:
+            conn.execute(text(
+                "ALTER TABLE team_bonus ADD COLUMN member_ids_snapshot TEXT"
+            ))
+            print("team_bonus: added member_ids_snapshot column.")
+        else:
+            print("team_bonus: member_ids_snapshot already present.")
+
+
+def migrate_profit_sharing_snapshot():
+    """Adds headcount to profit_sharing if it is missing.
+
+    This column freezes the employee headcount at award time so that
+    future hires or departures don't alter historical per-employee profit
+    shares (Rank 5 — Payroll Immutability).  Existing rows default to 0,
+    which causes the calculation layer to fall back to the live employee
+    count for backward compatibility.
+    """
+    columns = _existing_columns("profit_sharing")
+    if columns is None:
+        print("profit_sharing: table not found — run setup_db.py for a fresh database.")
+        return
+    if "headcount" in columns:
+        print("profit_sharing: headcount already present.")
+        return
+    with _engine.begin() as conn:
+        conn.execute(text(
+            "ALTER TABLE profit_sharing ADD COLUMN headcount INT NOT NULL DEFAULT 0"
+        ))
+    print("profit_sharing: added headcount column (defaults to 0 for existing rows).")
+
+
 if __name__ == "__main__":
     print(f"Connected to {DB_TYPE} database '{DB_NAME}'. Back up before continuing.")
     migrate_employees()
     migrate_users()
     migrate_bonus_budgets_table()
+    migrate_app_settings_table()
+    migrate_audit_logs_table()
+    migrate_team_bonus_snapshot()
+    migrate_profit_sharing_snapshot()
     admin_password = ensure_default_admin()
     if admin_password:
         print()

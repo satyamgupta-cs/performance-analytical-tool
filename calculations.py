@@ -19,6 +19,7 @@ tables and simply summed up for whichever date range is selected.
 
 import streamlit as st
 import pandas as pd
+from decimal import Decimal, ROUND_HALF_UP
 
 
 def date_range_filter(performance_df, key_prefix=""):
@@ -52,24 +53,41 @@ def add_kpi_columns(df):
     """Add Task Completion Rate, On-Time Delivery Rate, Customer Satisfaction
     and Attendance Rate columns to a performance-style dataframe."""
     df = df.copy()
-    df["Task_Completion_Rate"] = (df["completed_tasks"] / df["assigned_tasks"]) * 100
+    assigned = df["assigned_tasks"].replace(0, pd.NA)
+    df["Task_Completion_Rate"] = ((df["completed_tasks"] / assigned) * 100).fillna(0)
+
+    completed = df["completed_tasks"].replace(0, pd.NA)
     df["On_Time_Delivery_Rate"] = (
-        df["completed_before_deadline"] / df["completed_tasks"].replace(0, pd.NA)
-    ) * 100
-    df["On_Time_Delivery_Rate"] = df["On_Time_Delivery_Rate"].fillna(0)
-    df["Customer_Satisfaction"] = (df["customer_rating"] / 5) * 100
-    df["Attendance_Rate"] = (df["present_days"] / df["working_days"]) * 100
+        (df["completed_before_deadline"] / completed) * 100
+    ).fillna(0)
+
+    df["Customer_Satisfaction"] = (df["customer_rating"].fillna(0) / 5) * 100
+
+    working = df["working_days"].replace(0, pd.NA)
+    df["Attendance_Rate"] = ((df["present_days"] / working) * 100).fillna(0)
     return df
 
 
-def add_overall_score(df, weights):
+def add_overall_score(df, weights=None):
     """Add Overall_Score column using the given KPI weights dict."""
     df = df.copy()
+    if weights is None:
+        try:
+            from db_utils import get_weights
+            weights = get_weights()
+        except Exception:
+            weights = {"task": 0.35, "ontime": 0.25, "satisfaction": 0.20, "attendance": 0.20}
+
+    task_w = float(weights.get("task", 0.35))
+    ontime_w = float(weights.get("ontime", 0.25))
+    sat_w = float(weights.get("satisfaction", 0.20))
+    att_w = float(weights.get("attendance", 0.20))
+
     df["Overall_Score"] = (
-        weights["task"] * df["Task_Completion_Rate"]
-        + weights["ontime"] * df["On_Time_Delivery_Rate"]
-        + weights["satisfaction"] * df["Customer_Satisfaction"]
-        + weights["attendance"] * df["Attendance_Rate"]
+        task_w * df["Task_Completion_Rate"]
+        + ontime_w * df["On_Time_Delivery_Rate"]
+        + sat_w * df["Customer_Satisfaction"]
+        + att_w * df["Attendance_Rate"]
     )
     return df
 
@@ -77,10 +95,20 @@ def add_overall_score(df, weights):
 def add_bonus_column(df, bonus_policy_df):
     """Add Bonus_Percent column by looking up each Overall_Score in the bonus policy table."""
     df = df.copy()
+    if bonus_policy_df is None or bonus_policy_df.empty:
+        df["Bonus_Percent"] = 0.0
+        return df
+
+    sorted_policy = bonus_policy_df.sort_values(by="min_score", ascending=False)
 
     def lookup_bonus(score):
-        for _, row in bonus_policy_df.iterrows():
-            if row["min_score"] <= score <= row["max_score"]:
+        try:
+            # Use Decimal with ROUND_HALF_UP to prevent floating-point boundary dropouts (e.g. 59.995 -> 60.00)
+            s = float(Decimal(str(score)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP))
+        except (ValueError, TypeError, Exception):
+            return 0.0
+        for _, row in sorted_policy.iterrows():
+            if s >= float(row["min_score"]):
                 return float(row["bonus_percent"])
         return 0.0
 
@@ -137,7 +165,7 @@ def add_salary_columns(summary_df, salary_df):
     the monthly base salary, i.e. the "basic salary")."""
     df = summary_df.merge(salary_df, on="employee_id", how="left")
     for col in ("monthly_base_salary", "hra", "allowance"):
-        df[col] = df[col].fillna(0)
+        df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0.0)
     df["Performance_Bonus"] = df["monthly_base_salary"] * df["Bonus_Percent"] / 100
     df["Monthly_Fixed_Salary"] = df["monthly_base_salary"] + df["hra"] + df["allowance"]
     return df
@@ -148,39 +176,90 @@ def aggregate_spot_bonus(spot_bonus_df, performance_df_in_range):
     if spot_bonus_df.empty:
         return pd.DataFrame(columns=["employee_id", "Spot_Bonus"])
     mask = _month_in_range(spot_bonus_df["month"], performance_df_in_range)
-    totals = spot_bonus_df[mask].groupby("employee_id")["amount"].sum().reset_index()
+    in_range = spot_bonus_df[mask].copy()
+    if in_range.empty:
+        return pd.DataFrame(columns=["employee_id", "Spot_Bonus"])
+    in_range["amount"] = pd.to_numeric(in_range["amount"], errors="coerce").fillna(0.0)
+    totals = in_range.groupby("employee_id")["amount"].sum().reset_index()
     return totals.rename(columns={"amount": "Spot_Bonus"})
 
 
 def aggregate_team_bonus(team_bonus_df, team_members_df, performance_df_in_range):
-    """Total Team Bonus share per employee: each team_bonus record's
-    total_amount is split evenly across that team's current members, for
-    whichever months are in range."""
-    if team_bonus_df.empty or team_members_df.empty:
+    """Total Team Bonus share per employee.
+
+    Each team_bonus record's total_amount is divided by the
+    member_count_snapshot stored at award time and credited to the
+    member_ids_snapshot recipient list (Rank 5 Task 3). This prevents
+    retroactive changes when team members are added or removed after the
+    bonus was recorded. Rows without a snapshot (legacy data) fall back
+    to counting the live team_members_df roster for backward compatibility.
+    """
+    if team_bonus_df.empty:
         return pd.DataFrame(columns=["employee_id", "Team_Bonus"])
 
     mask = _month_in_range(team_bonus_df["month"], performance_df_in_range)
     in_range = team_bonus_df[mask]
 
-    member_counts = team_members_df.groupby("team_id")["employee_id"].nunique()
+    # Pre-compute live counts as the fallback for legacy rows
+    live_member_counts = team_members_df.groupby("team_id")["employee_id"].nunique() if not team_members_df.empty else {}
+
     shares = []
     for _, row in in_range.iterrows():
-        count = member_counts.get(row["team_id"], 0)
-        if count == 0:
-            continue
-        per_member = float(row["total_amount"]) / count
-        members = team_members_df[team_members_df["team_id"] == row["team_id"]]["employee_id"]
-        for emp_id in members:
-            shares.append({"employee_id": emp_id, "Team_Bonus": per_member})
+        team_id = row["team_id"]
+        # Check if recipient employee IDs were snapshotted
+        snapshot_members = None
+        if "member_ids_snapshot" in row and pd.notna(row["member_ids_snapshot"]) and row["member_ids_snapshot"]:
+            try:
+                import json
+                parsed = json.loads(str(row["member_ids_snapshot"]))
+                if isinstance(parsed, list) and len(parsed) > 0:
+                    snapshot_members = list(dict.fromkeys(int(x) for x in parsed))
+            except Exception:
+                snapshot_members = None
+
+        if snapshot_members is not None:
+            count = len(snapshot_members)
+            try:
+                tot = float(row["total_amount"])
+            except (ValueError, TypeError):
+                tot = 0.0
+            per_member = tot / count if count > 0 else 0.0
+            for emp_id in snapshot_members:
+                shares.append({"employee_id": emp_id, "Team_Bonus": per_member})
+        else:
+            # Fallback for legacy rows without recipient snapshot
+            if team_members_df.empty:
+                continue
+            try:
+                snapshot = int(row["member_count_snapshot"]) if "member_count_snapshot" in row and pd.notna(row["member_count_snapshot"]) and int(row["member_count_snapshot"]) > 0 else 0
+            except (ValueError, TypeError):
+                snapshot = 0
+            count = snapshot if snapshot > 0 else live_member_counts.get(team_id, 0)
+            if count == 0:
+                continue
+            try:
+                tot = float(row["total_amount"])
+            except (ValueError, TypeError):
+                tot = 0.0
+            per_member = tot / count
+            members = team_members_df[team_members_df["team_id"] == team_id]["employee_id"].unique()
+            for emp_id in members:
+                shares.append({"employee_id": emp_id, "Team_Bonus": per_member})
 
     if not shares:
         return pd.DataFrame(columns=["employee_id", "Team_Bonus"])
     return pd.DataFrame(shares).groupby("employee_id")["Team_Bonus"].sum().reset_index()
 
 
-def aggregate_profit_sharing(profit_sharing_df, employees_df, performance_df_in_range):
-    """Total Profit-Sharing share per employee: each period's pool_amount is
-    split evenly across every current employee, for periods in range."""
+def aggregate_profit_sharing(profit_sharing_df, employees_df, performance_df_in_range, total_headcount=None):
+    """Total Profit-Sharing share per employee.
+
+    Each period's pool_amount is divided by the headcount snapshotted at
+    award time (Rank 5 Task 2). This prevents retroactive changes when
+    employees join or leave after the pool was recorded. Rows without a
+    snapshot (legacy data or headcount = 0) fall back to total_headcount
+    or len(employees_df) for backward compatibility.
+    """
     if profit_sharing_df.empty or employees_df.empty:
         return pd.DataFrame(columns=["employee_id", "Profit_Share_Bonus"])
 
@@ -189,7 +268,22 @@ def aggregate_profit_sharing(profit_sharing_df, employees_df, performance_df_in_
     if in_range.empty:
         return pd.DataFrame(columns=["employee_id", "Profit_Share_Bonus"])
 
-    per_employee_total = in_range["pool_amount"].astype(float).sum() / len(employees_df)
+    fallback_headcount = total_headcount if (total_headcount is not None and total_headcount > 0) else len(employees_df)
+
+    def _per_employee(row):
+        """Use the frozen headcount; fall back to company headcount for old records."""
+        try:
+            snapshot = int(row["headcount"]) if "headcount" in row and pd.notna(row["headcount"]) and int(row["headcount"]) > 0 else 0
+        except (ValueError, TypeError):
+            snapshot = 0
+        denominator = snapshot if snapshot > 0 else fallback_headcount
+        try:
+            amt = float(row["pool_amount"])
+        except (ValueError, TypeError):
+            amt = 0.0
+        return amt / denominator if denominator > 0 else 0.0
+
+    per_employee_total = in_range.apply(_per_employee, axis=1).sum()
     return pd.DataFrame({
         "employee_id": employees_df["employee_id"],
         "Profit_Share_Bonus": per_employee_total,
@@ -205,7 +299,11 @@ def aggregate_referral_bonus(referral_df, performance_df_in_range):
     if paid.empty:
         return pd.DataFrame(columns=["employee_id", "Referral_Bonus"])
     mask = _month_in_range(paid["payout_month"].fillna(""), performance_df_in_range)
-    totals = paid[mask].groupby("referrer_employee_id")["bonus_amount"].sum().reset_index()
+    in_range = paid[mask].copy()
+    if in_range.empty:
+        return pd.DataFrame(columns=["employee_id", "Referral_Bonus"])
+    in_range["bonus_amount"] = pd.to_numeric(in_range["bonus_amount"], errors="coerce").fillna(0.0)
+    totals = in_range.groupby("referrer_employee_id")["bonus_amount"].sum().reset_index()
     return totals.rename(columns={"referrer_employee_id": "employee_id", "bonus_amount": "Referral_Bonus"})
 
 def build_department_analytics(summary_df, full_summary_df):
@@ -232,7 +330,8 @@ def format_lakhs(amount):
 
 def build_full_salary_summary(summary_df, performance_df_in_range, salary_df,
                                 spot_bonus_df, team_bonus_df, team_members_df,
-                                profit_sharing_df, employees_df, referral_df):
+                                profit_sharing_df, employees_df, referral_df,
+                                total_headcount=None):
     """Combine performance-based summary + every bonus source into the final
     salary breakdown table: Monthly_Fixed_Salary, each bonus component,
     Total_Bonus and In_Hand_Salary (for the selected date range)."""
@@ -241,7 +340,7 @@ def build_full_salary_summary(summary_df, performance_df_in_range, salary_df,
     for component_df, col in (
         (aggregate_spot_bonus(spot_bonus_df, performance_df_in_range), "Spot_Bonus"),
         (aggregate_team_bonus(team_bonus_df, team_members_df, performance_df_in_range), "Team_Bonus"),
-        (aggregate_profit_sharing(profit_sharing_df, employees_df, performance_df_in_range), "Profit_Share_Bonus"),
+        (aggregate_profit_sharing(profit_sharing_df, employees_df, performance_df_in_range, total_headcount=total_headcount), "Profit_Share_Bonus"),
         (aggregate_referral_bonus(referral_df, performance_df_in_range), "Referral_Bonus"),
     ):
         df = df.merge(component_df, on="employee_id", how="left")
@@ -324,7 +423,7 @@ def build_budget_utilization(budgets_df, employees_df, performance_df, weights, 
 
 def build_month_payslip(emp_id, month, employees_df, performance_df, weights, bonus_policy_df,
                          salary_df, spot_bonus_df, team_bonus_df, team_members_df,
-                         profit_sharing_df, referral_df):
+                         profit_sharing_df, referral_df, total_headcount=None):
     """Pay breakdown for one employee for a single month - what actually goes
     on a payslip, as opposed to the lifetime/date-range totals used by the
     Salary & Bonus Breakdown section. Returns None if there's no performance
@@ -358,7 +457,7 @@ def build_month_payslip(emp_id, month, employees_df, performance_df, weights, bo
 
     spot_amt = _lookup(aggregate_spot_bonus(spot_bonus_df, month_perf), "Spot_Bonus")
     team_amt = _lookup(aggregate_team_bonus(team_bonus_df, team_members_df, month_perf), "Team_Bonus")
-    profit_amt = _lookup(aggregate_profit_sharing(profit_sharing_df, employees_df, month_perf), "Profit_Share_Bonus")
+    profit_amt = _lookup(aggregate_profit_sharing(profit_sharing_df, employees_df, month_perf, total_headcount=total_headcount), "Profit_Share_Bonus")
     referral_amt = _lookup(aggregate_referral_bonus(referral_df, month_perf), "Referral_Bonus")
 
     total_bonus = performance_bonus + spot_amt + team_amt + profit_amt + referral_amt

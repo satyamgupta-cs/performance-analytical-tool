@@ -20,7 +20,7 @@ CREATE TABLE IF NOT EXISTS employees (
     department       VARCHAR(50)  NOT NULL,
     email            VARCHAR(120),
     phone            VARCHAR(20),
-    base_salary      DECIMAL(10,2) NOT NULL DEFAULT 0,
+    base_salary      DECIMAL(10,2) NOT NULL DEFAULT 0, -- Deprecated: canonical salary is stored in salary_structure.monthly_base_salary
     experience_years INT NOT NULL DEFAULT 0,
     joining_year     INT
 );
@@ -121,23 +121,31 @@ CREATE TABLE IF NOT EXISTS spot_bonus (
 
 -- Team Bonus: a bonus pool awarded to a whole team for team-level performance,
 -- split evenly across that team's members when calculating each person's pay.
+-- member_count_snapshot and member_ids_snapshot are frozen at award time so
+-- future roster changes do not alter historical per-member shares or recipients
+-- (Rank 5 payroll immutability).
 CREATE TABLE IF NOT EXISTS team_bonus (
-    team_bonus_id SERIAL PRIMARY KEY,
-    team_id       INT NOT NULL REFERENCES teams(team_id) ON DELETE CASCADE,
-    month         VARCHAR(7) NOT NULL,
-    total_amount  DECIMAL(10,2) NOT NULL,
-    reason        VARCHAR(255)
+    team_bonus_id         SERIAL PRIMARY KEY,
+    team_id               INT NOT NULL REFERENCES teams(team_id) ON DELETE CASCADE,
+    month                 VARCHAR(7) NOT NULL,
+    total_amount          DECIMAL(10,2) NOT NULL,
+    reason                VARCHAR(255),
+    member_count_snapshot INT NOT NULL DEFAULT 0,  -- headcount at time of award
+    member_ids_snapshot   TEXT                     -- JSON list of recipient employee_ids at award time
 );
 
 -- Profit-Sharing Bonus: company-wide profit pool for a period, split evenly
 -- across every employee when calculating each person's pay.
 -- e.g. company_profit = 10,00,00,000 and pool_percent = 5 -> pool_amount = 50,00,000
+-- headcount is snapshotted at award time so future hires/exits do not alter
+-- historical per-employee shares (Rank 5 payroll immutability).
 CREATE TABLE IF NOT EXISTS profit_sharing (
     profit_sharing_id SERIAL PRIMARY KEY,
     period            VARCHAR(7) NOT NULL,        -- format: YYYY-MM (payout month)
     company_profit    DECIMAL(14,2) NOT NULL,
     pool_percent      DECIMAL(5,2) NOT NULL,
-    pool_amount       DECIMAL(14,2) NOT NULL      -- = company_profit * pool_percent / 100
+    pool_amount       DECIMAL(14,2) NOT NULL,     -- = company_profit * pool_percent / 100
+    headcount         INT NOT NULL DEFAULT 0      -- employee count at time of award
 );
 
 -- Referral Bonus: paid to the referring employee once their referred
@@ -159,6 +167,36 @@ CREATE TABLE IF NOT EXISTS company_settings (
     id                           INT PRIMARY KEY,
     default_referral_bonus      DECIMAL(10,2) NOT NULL,
     default_profit_pool_percent DECIMAL(5,2) NOT NULL
+);
+
+-- Application settings (e.g. payslip configuration JSON, system-wide toggles)
+CREATE TABLE IF NOT EXISTS app_settings (
+    config_key   VARCHAR(100) PRIMARY KEY,
+    config_value TEXT NOT NULL,
+    updated_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+-- Departmental bonus budget tracking
+CREATE TABLE IF NOT EXISTS bonus_budgets (
+    budget_id        SERIAL PRIMARY KEY,
+    department       VARCHAR(50) NOT NULL,
+    period_type      VARCHAR(20) NOT NULL DEFAULT 'custom',
+    period_start     DATE NOT NULL,
+    period_end       DATE NOT NULL,
+    allocated_amount DECIMAL(12,2) NOT NULL DEFAULT 0,
+    notes            VARCHAR(255),
+    created_at       TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE (department, period_start, period_end)
+);
+
+-- Central audit log trail (PostgreSQL, replacing local SQLite)
+CREATE TABLE IF NOT EXISTS audit_logs (
+    log_id    SERIAL PRIMARY KEY,
+    timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    username  VARCHAR(120) NOT NULL,
+    action    VARCHAR(255) NOT NULL,
+    old_value TEXT DEFAULT '—',
+    new_value TEXT DEFAULT '—'
 );
 
 -- ============================================================

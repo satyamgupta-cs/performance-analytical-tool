@@ -3,9 +3,13 @@ import streamlit as st
 
 from ui_design import apply_modern_ui, top_profile_bar
 from db_utils import (
-    get_employees_df, get_performance_df, get_weights, get_bonus_policy,
-    get_salary_structure_df, get_spot_bonus_df, get_team_bonus_df,
-    get_team_members_df, get_profit_sharing_df, get_referral_bonus_df,
+    get_employee_by_id, get_performance_by_employee_id,
+    get_salary_structure_by_employee_id, get_spot_bonus_by_employee_id,
+    get_team_bonus_by_employee_id, get_team_members_by_employee_id,
+    get_profit_sharing_df, get_referral_bonus_by_employee_id,
+    get_active_employee_count, get_department_rank_and_size,
+    get_weights, get_bonus_policy,
+    change_user_password,
 )
 from calculations import build_employee_summary, build_full_salary_summary, build_month_payslip
 from payslip_utils import generate_payslip_pdf
@@ -21,37 +25,43 @@ top_profile_bar()
 
 st.title("My Dashboard")
 
-employees_df = get_employees_df()
-performance_df = get_performance_df()
+emp_id = st.session_state.get("employee_id")
+
+# Fetch only this employee's own records at the SQL level (Finding H-8).
+# No other employee's salary, KPI data, or ratings are loaded into memory.
+employees_df = get_employee_by_id(emp_id)
+performance_df = get_performance_by_employee_id(emp_id)
+
+if employees_df.empty:
+    st.info("No employee record found for your account. Contact your administrator.")
+    st.stop()
+
 weights = get_weights()
 bonus_policy_df = get_bonus_policy()
-salary_df = get_salary_structure_df()
-spot_bonus_df = get_spot_bonus_df()
-team_bonus_df = get_team_bonus_df()
-team_members_df = get_team_members_df()
+salary_df = get_salary_structure_by_employee_id(emp_id)
+spot_bonus_df = get_spot_bonus_by_employee_id(emp_id)
+team_bonus_df = get_team_bonus_by_employee_id(emp_id)
+team_members_df = get_team_members_by_employee_id(emp_id)
 profit_sharing_df = get_profit_sharing_df()
-referral_df = get_referral_bonus_df()
+referral_df = get_referral_bonus_by_employee_id(emp_id)
+active_headcount = get_active_employee_count()
 
-emp_id = st.session_state.get("employee_id")
 summary = build_employee_summary(employees_df, performance_df, weights, bonus_policy_df)
 full_summary = build_full_salary_summary(
     summary, performance_df, salary_df, spot_bonus_df, team_bonus_df,
     team_members_df, profit_sharing_df, employees_df, referral_df,
+    total_headcount=active_headcount,
 )
 
-emp_row = full_summary[full_summary["employee_id"] == emp_id]
-if emp_row.empty:
+emp_row = full_summary[full_summary["employee_id"].astype(str) == str(emp_id)]
+if performance_df.empty or emp_row.empty:
     st.info("No performance data recorded for your account yet. Check back after your first month is entered.")
     st.stop()
 
 emp = emp_row.iloc[0]
 
-# Rank within department, by Overall Score, among everyone with data
-dept_peers = summary[summary["department"] == emp["department"]].sort_values(
-    "Overall_Score", ascending=False
-).reset_index(drop=True)
-dept_rank = int(dept_peers[dept_peers["employee_id"] == emp_id].index[0]) + 1
-dept_size = len(dept_peers)
+# Department rank is computed server-side without loading peer records into the page
+dept_rank, dept_size = get_department_rank_and_size(emp_id, weights)
 
 # ---------------- My Performance ----------------
 st.subheader("My Performance")
@@ -60,7 +70,8 @@ c1.metric("Overall Score", f"{emp['Overall_Score']:.1f}")
 c2.metric("Department Rank", f"{dept_rank} / {dept_size}")
 c3.metric("Attendance", f"{emp['Attendance_Rate']:.0f}%")
 c4.metric("Task Completion", f"{emp['Task_Completion_Rate']:.0f}%")
-c5.metric("Customer Rating", f"{emp['customer_rating']:.1f}/5")
+rating_display = f"{emp['customer_rating']:.1f}/5" if pd.notna(emp.get("customer_rating")) else "—/5"
+c5.metric("Customer Rating", rating_display)
 
 st.divider()
 
@@ -92,13 +103,14 @@ st.divider()
 
 # ---------------- Payslip ----------------
 st.subheader("Payslip")
-emp_history = performance_df[performance_df["employee_id"] == emp_id]
-available_months = sorted(emp_history["month"].unique(), reverse=True)
+# performance_df is already scoped to this employee only
+available_months = sorted(performance_df["month"].unique(), reverse=True)
 if available_months:
     payslip_month = st.selectbox("Month", available_months)
     payslip_data = build_month_payslip(
         emp_id, payslip_month, employees_df, performance_df, weights, bonus_policy_df,
         salary_df, spot_bonus_df, team_bonus_df, team_members_df, profit_sharing_df, referral_df,
+        total_headcount=active_headcount,
     )
     if payslip_data:
         st.download_button(
@@ -111,3 +123,32 @@ if available_months:
         st.info("No payslip data available for that month.")
 else:
     st.info("No performance records yet, so no payslip can be generated.")
+
+# ============================================================
+# Change Password
+# ============================================================
+st.divider()
+st.subheader("Change Password")
+st.caption("Use this form to change your password. You must enter your current password to confirm the change.")
+
+with st.form("change_password_form", clear_on_submit=True):
+    current_password = st.text_input("Current Password", type="password")
+    new_password = st.text_input("New Password", type="password")
+    confirm_password = st.text_input("Confirm New Password", type="password")
+    submitted = st.form_submit_button("Update Password")
+
+    if submitted:
+        if not current_password or not new_password or not confirm_password:
+            st.error("All fields are required.")
+        elif new_password != confirm_password:
+            st.error("New passwords do not match.")
+        elif len(new_password) < 6:
+            st.error("New password must be at least 6 characters long.")
+        elif new_password == current_password:
+            st.error("New password must be different from your current password.")
+        else:
+            username = st.session_state.get("username", "")
+            if change_user_password(username, current_password, new_password):
+                st.success("Password updated successfully.")
+            else:
+                st.error("Current password is incorrect. Please try again.")

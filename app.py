@@ -1,6 +1,7 @@
 import streamlit as st
-import random
+import secrets
 import time
+from datetime import datetime, timedelta
 from db_utils import attempt_login, run_query, admin_reset_password
 from ui_design import apply_modern_ui
 
@@ -13,6 +14,10 @@ if "recovery_code" not in st.session_state:
     st.session_state.recovery_code = None
 if "reset_email" not in st.session_state:
     st.session_state.reset_email = None
+if "recovery_code_expires_at" not in st.session_state:
+    st.session_state.recovery_code_expires_at = None
+if "pin_attempts" not in st.session_state:
+    st.session_state.pin_attempts = 0
 
 
 def login_page():
@@ -71,6 +76,8 @@ def login_page():
             if st.button("Cancel & Go Back"):
                 st.session_state.reset_mode = False
                 st.session_state.recovery_code = None
+                st.session_state.recovery_code_expires_at = None
+                st.session_state.pin_attempts = 0
                 st.rerun()
 
         with col2:
@@ -79,42 +86,88 @@ def login_page():
 
                 if not df.empty:
                     st.session_state.reset_email = email_input
-                    st.session_state.recovery_code = str(random.randint(100000, 999999))
+                    # Cryptographically secure 6-digit PIN (Finding H-2)
+                    st.session_state.recovery_code = str(secrets.randbelow(900000) + 100000)
+                    # 10-minute expiry timestamp
+                    st.session_state.recovery_code_expires_at = datetime.utcnow() + timedelta(minutes=10)
+                    # Reset attempt counter for new code
+                    st.session_state.pin_attempts = 0
 
                     with st.spinner("Sending email..."):
                         from email_utils import send_recovery_email
                         success, message = send_recovery_email(email_input, st.session_state.recovery_code)
 
                     if success:
-                        st.success("Recovery code sent to your email. Check your spam folder if you don't see it.")
+                        st.success("Recovery code sent to your email. It expires in 10 minutes. Check your spam folder if you don't see it.")
                     else:
                         st.error(message)
                         st.session_state.recovery_code = None
+                        st.session_state.recovery_code_expires_at = None
                 else:
                     st.error("We couldn't find an account with that email address.")
 
         # Show the reset form only if a code has been generated and sent
         if st.session_state.recovery_code:
             st.divider()
+
+            # --- Check expiry ---
+            if datetime.utcnow() > st.session_state.recovery_code_expires_at:
+                st.error("Your recovery code has expired. Please request a new one.")
+                st.session_state.recovery_code = None
+                st.session_state.recovery_code_expires_at = None
+                st.session_state.pin_attempts = 0
+                st.rerun()
+
+            # --- Check attempt limit ---
+            MAX_PIN_ATTEMPTS = 3
+            if st.session_state.pin_attempts >= MAX_PIN_ATTEMPTS:
+                st.error("Too many incorrect attempts. Please request a new recovery code.")
+                st.session_state.recovery_code = None
+                st.session_state.recovery_code_expires_at = None
+                st.session_state.pin_attempts = 0
+                st.rerun()
+
+            attempts_left = MAX_PIN_ATTEMPTS - st.session_state.pin_attempts
+            st.caption(f"⏱ Code expires 10 minutes after it was sent. {attempts_left} attempt(s) remaining.")
+
             with st.form("new_password_form"):
                 entered_code = st.text_input("Enter 6-Digit Code")
                 new_pass = st.text_input("New Password", type="password")
                 confirm_pass = st.text_input("Confirm New Password", type="password")
 
                 if st.form_submit_button("Update Password"):
-                    if entered_code != st.session_state.recovery_code:
-                        st.error("Invalid recovery code.")
+                    # Re-check expiry inside form submission
+                    if datetime.utcnow() > st.session_state.recovery_code_expires_at:
+                        st.error("Your recovery code has expired. Please request a new one.")
+                        st.session_state.recovery_code = None
+                        st.session_state.recovery_code_expires_at = None
+                        st.session_state.pin_attempts = 0
+                    elif entered_code != st.session_state.recovery_code:
+                        st.session_state.pin_attempts += 1
+                        remaining = MAX_PIN_ATTEMPTS - st.session_state.pin_attempts
+                        if remaining > 0:
+                            st.error(f"Invalid recovery code. {remaining} attempt(s) remaining.")
+                        else:
+                            st.error("Too many incorrect attempts. Please request a new recovery code.")
+                            st.session_state.recovery_code = None
+                            st.session_state.recovery_code_expires_at = None
                     elif new_pass != confirm_pass:
                         st.error("Passwords do not match.")
                     elif len(new_pass) < 6:
                         st.error("Password must be at least 6 characters long.")
                     else:
-                        success = admin_reset_password(st.session_state.reset_email, new_pass)
+                        success = admin_reset_password(
+                            st.session_state.reset_email,
+                            new_pass,
+                            verified_via_recovery_flow=True,
+                        )
                         if success:
                             st.success("Password updated successfully. Redirecting to login...")
                             time.sleep(2)
                             st.session_state.reset_mode = False
                             st.session_state.recovery_code = None
+                            st.session_state.recovery_code_expires_at = None
+                            st.session_state.pin_attempts = 0
                             st.rerun()
                         else:
                             st.error("A database error occurred.")

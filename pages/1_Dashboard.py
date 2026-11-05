@@ -1,7 +1,6 @@
 import plotly.express as px
 import streamlit as st
 import pandas as pd
-from db_utils import run_query
 
 from anomaly_detection import (
     DEFAULT_ALPHA,
@@ -56,7 +55,7 @@ profit_sharing_df = get_profit_sharing_df()
 referral_df = get_referral_bonus_df()
 
 # Standings Overview Table
-df = get_all_performance_with_standing()
+df = get_all_performance_with_standing(weights)
 if not df.empty:
     st.subheader("Employee Performance Overview")
     st.dataframe(
@@ -258,6 +257,8 @@ def render_risk_classification_section(df_employees: pd.DataFrame):
         return
 
     df_classified = df_employees.copy()
+    if "score" not in df_classified.columns and "Overall_Score" in df_classified.columns:
+        df_classified["score"] = df_classified["Overall_Score"]
 
     # Classification logic based on calculated score
     def classify_simple(score):
@@ -327,29 +328,5 @@ def render_risk_classification_section(df_employees: pd.DataFrame):
         width="stretch"
     )
 
-# Fetch latest month performance and compute score dynamically
-query = """
-SELECT 
-    e.employee_id,
-    e.name,
-    e.department,
-    p.month,
-    p.assigned_tasks,
-    p.completed_tasks,
-    p.completed_before_deadline,
-    p.working_days,
-    p.present_days,
-    p.customer_rating,
-    ROUND(
-        (COALESCE(p.completed_tasks::float / NULLIF(p.assigned_tasks, 0), 0) * 40) +
-        (COALESCE(p.present_days::float / NULLIF(p.working_days, 0), 0) * 30) +
-        (COALESCE(p.completed_before_deadline::float / NULLIF(p.completed_tasks, 0), 0) * 20) +
-        (COALESCE(p.customer_rating::float / 5.0, 0) * 10)
-    ) AS score
-FROM employees e
-JOIN performance p ON e.employee_id = p.employee_id
-WHERE p.month = (SELECT MAX(month) FROM performance)
-"""
-# Run query and render dashboard
-df_employees = run_query(query, fetch=True)
-render_risk_classification_section(df_employees)
+# Render risk classification section using unified employee summary
+render_risk_classification_section(summary)

@@ -30,7 +30,6 @@ import re
 import secrets
 import string
 from decimal import Decimal
-import sqlite3
 from datetime import datetime
 import bcrypt
 import pandas as pd
@@ -49,8 +48,6 @@ CONFIG_PATH = os.path.join(os.path.dirname(__file__), "database", "db_config.jso
 
 _IDENTIFIER_RE = re.compile(r'^[a-zA-Z_][a-zA-Z0-9_]*$')
 
-DB_FILE = "app_database.db"
-
 def _load_saved_config():
     """Load DB settings previously saved from the Settings page, if any."""
     if os.path.exists(CONFIG_PATH):
@@ -65,7 +62,14 @@ def _load_saved_config():
 def save_db_config(db_type, host, port, user, password, name):
     """Persist DB connection settings to database/db_config.json so the
     choice survives app restarts (used by the Settings page's DB switcher).
-    Environment variables always take priority over this file."""
+    Environment variables always take priority over this file.
+
+    SECURITY: DB_PASSWORD is intentionally excluded from the JSON file to
+    prevent plaintext credentials being written to disk.  Set the password
+    via the DB_PASSWORD environment variable (or in the project .env file).
+    If a password argument is supplied here it is silently ignored — the
+    caller (Settings page) already shows the user a note about this.
+    """
     os.makedirs(os.path.dirname(CONFIG_PATH), exist_ok=True)
     with open(CONFIG_PATH, "w") as f:
         json.dump(
@@ -74,7 +78,9 @@ def save_db_config(db_type, host, port, user, password, name):
                 "DB_HOST": host,
                 "DB_PORT": str(port),
                 "DB_USER": user,
-                "DB_PASSWORD": password,
+                # DB_PASSWORD is deliberately omitted — never write credentials
+                # to disk in plaintext.  Use DB_PASSWORD in .env or the OS
+                # environment instead.
                 "DB_NAME": name,
             },
             f,
@@ -125,7 +131,20 @@ def _make_engine(database):
         port=int(DB_PORT),
         database=database,
     )
-    return create_engine(url, pool_pre_ping=True)
+    connect_args = {}
+    if DB_TYPE == "postgresql":
+        # Enable SSL for Supabase or remote PostgreSQL hosts
+        if DB_HOST and DB_HOST not in ("localhost", "127.0.0.1"):
+            connect_args["sslmode"] = "require"
+
+    return create_engine(
+        url,
+        connect_args=connect_args,
+        pool_pre_ping=True,
+        pool_size=10,
+        max_overflow=20,
+        pool_recycle=1800,
+    )
 
 
 # Main engine, pointed at DB_NAME — reused for every normal query.
@@ -173,25 +192,37 @@ def current_db_info():
 
 
 def run_query(query, params=None, fetch=False):
-    """Run a single SQL query. If fetch=True, returns rows as a DataFrame."""
+    """Run a single SQL query. If fetch=True, returns rows as a DataFrame.
+    Guarantees connections and cursors are cleanly released in finally block."""
     conn = get_connection()
     cursor = conn.cursor()
-    cursor.execute(query, params or ())
-    result = None
-    if fetch:
-        columns = [col[0] for col in cursor.description]
-        rows = cursor.fetchall()
-        result = pd.DataFrame(rows, columns=columns)
-        # DECIMAL/NUMERIC columns come back as Decimal objects (on both
-        # drivers), which don't mix with plain floats in calculations.
-        for col in result.columns:
-            if result[col].apply(lambda x: isinstance(x, Decimal)).any():
-                result[col] = result[col].astype(float)
-    else:
-        conn.commit()
-    cursor.close()
-    conn.close()
-    return result
+    try:
+        cursor.execute(query, params or ())
+        result = None
+        if fetch:
+            if cursor.description:
+                columns = [col[0] for col in cursor.description]
+                rows = cursor.fetchall()
+                result = pd.DataFrame(rows, columns=columns)
+                # DECIMAL/NUMERIC columns come back as Decimal objects (on both
+                # drivers), which don't mix with plain floats in calculations.
+                for col in result.columns:
+                    if result[col].apply(lambda x: isinstance(x, Decimal)).any():
+                        result[col] = result[col].astype(float)
+            else:
+                result = pd.DataFrame()
+        else:
+            conn.commit()
+        return result
+    finally:
+        try:
+            cursor.close()
+        except Exception:
+            pass
+        try:
+            conn.close()
+        except Exception:
+            pass
 
 
 def _last_insert_id(cursor, returning_column):
@@ -215,14 +246,81 @@ def get_performance_df():
     return run_query("SELECT * FROM performance", fetch=True)
 
 
+def get_employee_by_id(employee_id):
+    """Return a single-row DataFrame for one employee only.
+    Used by My Dashboard so the page never loads other employees' data
+    into session memory (Finding H-8)."""
+    return run_query(
+        "SELECT * FROM employees WHERE employee_id = %s",
+        (employee_id,),
+        fetch=True,
+    )
+
+
+def get_performance_by_employee_id(employee_id):
+    """Return performance rows for a single employee only.
+    Used by My Dashboard so the page never loads other employees' KPI
+    records into session memory (Finding H-8)."""
+    return run_query(
+        "SELECT * FROM performance WHERE employee_id = %s",
+        (employee_id,),
+        fetch=True,
+    )
+
+
+def get_active_employee_count():
+    """Return the total number of employees in the company (Finding H-8)."""
+    df = run_query("SELECT COUNT(*) AS cnt FROM employees", fetch=True)
+    return int(df.iloc[0]["cnt"]) if not df.empty else 0
+
+
+def get_department_rank_and_size(employee_id, weights=None):
+    """Compute department rank and peer count for an employee on the backend
+    without exposing peer records or salaries to the front-end session (Finding H-8)."""
+    emp_df = run_query("SELECT department FROM employees WHERE employee_id = %s", (employee_id,), fetch=True)
+    if emp_df.empty or pd.isna(emp_df.iloc[0]["department"]):
+        return "—", 0
+    dept = emp_df.iloc[0]["department"]
+    if not dept:
+        return "—", 0
+    peers_df = run_query("SELECT employee_id, department FROM employees WHERE department = %s", (dept,), fetch=True)
+    if peers_df.empty:
+        return "—", 0
+    dept_perf = run_query(
+        """SELECT p.* FROM performance p
+           JOIN employees e ON e.employee_id = p.employee_id
+           WHERE e.department = %s""",
+        (dept,),
+        fetch=True,
+    )
+    if dept_perf.empty:
+        return "—", len(peers_df)
+    from calculations import build_employee_summary
+    summary = build_employee_summary(peers_df, dept_perf, weights, None)
+    dept_peers = summary.sort_values("Overall_Score", ascending=False).reset_index(drop=True)
+    match = dept_peers[dept_peers["employee_id"].astype(str) == str(employee_id)]
+    rank = int(match.index[0]) + 1 if not match.empty else "—"
+    return rank, len(dept_peers)
+
+
 def get_weights():
-    df = run_query("SELECT * FROM score_weights WHERE id = 1", fetch=True)
-    row = df.iloc[0]
+    try:
+        df = run_query("SELECT * FROM score_weights WHERE id = 1", fetch=True)
+        if df is not None and not df.empty:
+            row = df.iloc[0]
+            return {
+                "task": float(row["task_weight"]),
+                "ontime": float(row["ontime_weight"]),
+                "satisfaction": float(row["satisfaction_weight"]),
+                "attendance": float(row["attendance_weight"]),
+            }
+    except Exception:
+        pass
     return {
-        "task": float(row["task_weight"]),
-        "ontime": float(row["ontime_weight"]),
-        "satisfaction": float(row["satisfaction_weight"]),
-        "attendance": float(row["attendance_weight"]),
+        "task": 0.35,
+        "ontime": 0.25,
+        "satisfaction": 0.20,
+        "attendance": 0.20,
     }
 
 
@@ -346,20 +444,23 @@ def add_employee(name, department, email, phone, month, assigned_tasks,
     cursor = conn.cursor()
 
     try:
-        cursor.execute("SELECT MAX(employee_id) FROM employees")
-        max_id_result = cursor.fetchone()
-
-        if max_id_result and max_id_result[0] is not None:
-            new_id = int(max_id_result[0]) + 1
+        if DB_TYPE == "mysql":
+            cursor.execute(
+                """INSERT INTO employees
+                   (name, department, email, phone, base_salary, experience_years, joining_year)
+                   VALUES (%s, %s, %s, %s, %s, %s, %s)""",
+                (name, department, email, phone, monthly_base_salary, experience, joining_year)
+            )
+            new_id = cursor.lastrowid
         else:
-            new_id = 1001
-
-        cursor.execute(
-            """INSERT INTO employees
-               (employee_id, name, department, email, phone, base_salary, experience_years, joining_year)
-               VALUES (%s, %s, %s, %s, %s, %s, %s, %s)""",
-            (new_id, name, department, email, phone, monthly_base_salary, experience, joining_year)
-        )
+            cursor.execute(
+                """INSERT INTO employees
+                   (name, department, email, phone, base_salary, experience_years, joining_year)
+                   VALUES (%s, %s, %s, %s, %s, %s, %s)
+                   RETURNING employee_id""",
+                (name, department, email, phone, monthly_base_salary, experience, joining_year)
+            )
+            new_id = cursor.fetchone()[0]
 
         temp_password = None
         if email:
@@ -488,6 +589,15 @@ def ensure_default_admin():
 def get_salary_structure_df():
     return run_query("SELECT * FROM salary_structure", fetch=True)
 
+
+def get_salary_structure_by_employee_id(employee_id):
+    """Return salary structure for a single employee only (Finding H-8)."""
+    return run_query(
+        "SELECT * FROM salary_structure WHERE employee_id = %s",
+        (employee_id,),
+        fetch=True,
+    )
+
 def upsert_salary_structure(employee_id, monthly_base_salary, hra, allowance):
     """Insert the employee's salary structure if it doesn't exist yet,
     otherwise update it. Works the same way on both engines by checking
@@ -557,6 +667,20 @@ def get_team_members_df():
     )
 
 
+def get_team_members_by_employee_id(employee_id):
+    """Return team memberships only for teams that include this employee (Finding H-8)."""
+    return run_query(
+        """SELECT tm.team_id, t.team_name, tm.employee_id, e.name AS employee_name
+           FROM team_members tm
+           JOIN teams t ON t.team_id = tm.team_id
+           JOIN employees e ON e.employee_id = tm.employee_id
+           WHERE tm.team_id IN (SELECT team_id FROM team_members WHERE employee_id = %s)
+           ORDER BY t.team_name, e.name""",
+        (employee_id,),
+        fetch=True,
+    )
+
+
 def add_team_member(team_id, employee_id):
     """Add an employee to a team. Silently does nothing if already a member."""
     existing = run_query(
@@ -596,6 +720,18 @@ def get_spot_bonus_df():
     )
 
 
+def get_spot_bonus_by_employee_id(employee_id):
+    """Return spot bonus rows for a single employee only (Finding H-8)."""
+    return run_query(
+        """SELECT sb.*, e.name AS employee_name
+           FROM spot_bonus sb JOIN employees e ON e.employee_id = sb.employee_id
+           WHERE sb.employee_id = %s
+           ORDER BY sb.month DESC""",
+        (employee_id,),
+        fetch=True,
+    )
+
+
 def add_spot_bonus(employee_id, month, amount, reason_category, notes=""):
     run_query(
         """INSERT INTO spot_bonus (employee_id, month, amount, reason_category, notes)
@@ -617,11 +753,38 @@ def get_team_bonus_df():
     )
 
 
+def get_team_bonus_by_employee_id(employee_id):
+    """Return team bonus rows only for teams that include this employee (Finding H-8)."""
+    return run_query(
+        """SELECT tb.*, t.team_name
+           FROM team_bonus tb JOIN teams t ON t.team_id = tb.team_id
+           WHERE tb.team_id IN (SELECT team_id FROM team_members WHERE employee_id = %s)
+           ORDER BY tb.month DESC""",
+        (employee_id,),
+        fetch=True,
+    )
+
+
 def add_team_bonus(team_id, month, total_amount, reason=""):
+    """Record a team bonus.
+
+    member_count_snapshot and member_ids_snapshot are frozen at award time
+    (Finding H-3 / Rank 5 Task 3): splitting by the live team roster later
+    would retroactively change member shares or transfer past bonuses to
+    employees who joined the team after the award month.
+    """
+    members_df = run_query(
+        "SELECT employee_id FROM team_members WHERE team_id = %s ORDER BY employee_id",
+        (team_id,),
+        fetch=True,
+    )
+    member_ids = [int(x) for x in members_df["employee_id"]] if not members_df.empty else []
+    member_count = len(member_ids)
+    member_ids_json = json.dumps(member_ids)
     run_query(
-        """INSERT INTO team_bonus (team_id, month, total_amount, reason)
-           VALUES (%s,%s,%s,%s)""",
-        (team_id, month, total_amount, reason),
+        """INSERT INTO team_bonus (team_id, month, total_amount, reason, member_count_snapshot, member_ids_snapshot)
+           VALUES (%s,%s,%s,%s,%s,%s)""",
+        (team_id, month, total_amount, reason, member_count, member_ids_json),
     )
 
 
@@ -636,12 +799,21 @@ def get_profit_sharing_df():
 def add_profit_sharing(period, company_profit, pool_percent):
     """Record a profit-sharing pool for a period. pool_amount is computed
     here (company_profit x pool_percent / 100) and stored alongside the
-    inputs so historical records don't change if the % is edited later."""
+    inputs so historical records don't change if the % is edited later.
+
+    headcount is snapshotted at award time (Finding H-3 / Rank 5 Task 2):
+    dividing by the live employee count later would retroactively change
+    every employee's historical share whenever someone joins or leaves.
+    """
     pool_amount = float(company_profit) * float(pool_percent) / 100
+    # Snapshot the active headcount right now so the per-employee share
+    # is frozen at award time and immune to future roster changes.
+    headcount_df = run_query("SELECT COUNT(*) AS cnt FROM employees", fetch=True)
+    headcount = int(headcount_df.iloc[0]["cnt"]) if not headcount_df.empty else 0
     run_query(
-        """INSERT INTO profit_sharing (period, company_profit, pool_percent, pool_amount)
-           VALUES (%s,%s,%s,%s)""",
-        (period, company_profit, pool_percent, pool_amount),
+        """INSERT INTO profit_sharing (period, company_profit, pool_percent, pool_amount, headcount)
+           VALUES (%s,%s,%s,%s,%s)""",
+        (period, company_profit, pool_percent, pool_amount, headcount),
     )
     return pool_amount
 
@@ -658,6 +830,18 @@ def get_referral_bonus_df():
         """SELECT rb.*, e.name AS referrer_name
            FROM referral_bonus rb JOIN employees e ON e.employee_id = rb.referrer_employee_id
            ORDER BY rb.referral_date DESC""",
+        fetch=True,
+    )
+
+
+def get_referral_bonus_by_employee_id(employee_id):
+    """Return referral bonus rows for a single employee only (Finding H-8)."""
+    return run_query(
+        """SELECT rb.*, e.name AS referrer_name
+           FROM referral_bonus rb JOIN employees e ON e.employee_id = rb.referrer_employee_id
+           WHERE rb.referrer_employee_id = %s
+           ORDER BY rb.referral_date DESC""",
+        (employee_id,),
         fetch=True,
     )
 
@@ -884,10 +1068,26 @@ def change_user_password(username, old_password, new_password):
         return True
     return False
 
-def admin_reset_password(email, new_password):
-    """Resets a user's password without knowing the old one - used by the
-    self-service 'forgot password' recovery-code flow, and could also be
-    called from an admin-facing reset in future."""
+def admin_reset_password(email, new_password, *, verified_via_recovery_flow=False):
+    """Resets a user's password without knowing the old one.
+
+    This function MUST only be called after the caller has independently
+    verified the user's identity (e.g. via a time-limited recovery PIN).
+    Pass ``verified_via_recovery_flow=True`` to confirm that check was done.
+    Calling without that flag raises ``PermissionError`` so accidental
+    unauthenticated calls fail loudly instead of silently resetting passwords.
+
+    Args:
+        email: The user's registered email / username.
+        new_password: The new plaintext password to hash and store.
+        verified_via_recovery_flow: Caller must set this to True after
+            validating the recovery PIN; raises PermissionError otherwise.
+    """
+    if not verified_via_recovery_flow:
+        raise PermissionError(
+            "admin_reset_password requires verified_via_recovery_flow=True. "
+            "Verify the user's identity (e.g. recovery PIN) before calling this function."
+        )
     try:
         run_query(
             "UPDATE users SET password_hash = %s WHERE username = %s",
@@ -899,11 +1099,24 @@ def admin_reset_password(email, new_password):
         )
         return True
     except Exception as e:
-        print(f"Error resetting password: {e}")
+        import logging
+        logging.getLogger(__name__).error("Error resetting password for %s: %s", email, e)
         return False
     
-def get_all_performance_with_standing():
-    """Calculates a composite total score dynamically and assigns department rankings."""
+def get_all_performance_with_standing(weights=None):
+    """Calculates composite total scores and assigns department rankings
+    using configured weights from score_weights (authoritative calculation)."""
+    if weights is None:
+        try:
+            weights = get_weights()
+        except Exception:
+            weights = {"task": 0.35, "ontime": 0.25, "satisfaction": 0.20, "attendance": 0.20}
+
+    task_w = float(weights.get("task", 0.35))
+    ontime_w = float(weights.get("ontime", 0.25))
+    satisfaction_w = float(weights.get("satisfaction", 0.20))
+    attendance_w = float(weights.get("attendance", 0.20))
+
     query = """
     WITH CalculatedScores AS (
         SELECT 
@@ -913,9 +1126,10 @@ def get_all_performance_with_standing():
             e.department AS "Department",
             p.month AS "Month",
             ROUND(
-                (COALESCE(p.completed_tasks::numeric / NULLIF(p.assigned_tasks, 0), 0) * 50) +
-                (COALESCE(p.present_days::numeric / NULLIF(p.working_days, 0), 0) * 30) +
-                (COALESCE(p.customer_rating::numeric / 5.0, 0) * 20),
+                (COALESCE(p.completed_tasks::numeric / NULLIF(p.assigned_tasks, 0), 0) * 100 * %s) +
+                (COALESCE(p.completed_before_deadline::numeric / NULLIF(p.completed_tasks, 0), 0) * 100 * %s) +
+                (COALESCE(p.customer_rating::numeric / 5.0, 0) * 100 * %s) +
+                (COALESCE(p.present_days::numeric / NULLIF(p.working_days, 0), 0) * 100 * %s),
             1) AS total_score
         FROM employees e
         JOIN performance p ON e.employee_id = p.employee_id
@@ -947,7 +1161,7 @@ def get_all_performance_with_standing():
     FROM RankedData
     ORDER BY "Department", "Total Score" DESC;
     """
-    return run_query(query, fetch=True)
+    return run_query(query, params=(task_w, ontime_w, satisfaction_w, attendance_w), fetch=True)
 
 def get_employee_raw_performance(user_identifier):
     """Fetches raw performance metrics by matching employee_id, email, or employee name."""
@@ -974,48 +1188,50 @@ def get_employee_raw_performance(user_identifier):
     return None
 
 def init_audit_log_table():
-    """Creates the audit_logs table if it does not exist."""
-    conn = sqlite3.connect(DB_FILE)
-    cursor = conn.cursor()
-    cursor.execute(
+    """Ensures the audit_logs table exists in the configured database."""
+    if DB_TYPE == "mysql":
+        query = """
+            CREATE TABLE IF NOT EXISTS audit_logs (
+                log_id INT PRIMARY KEY AUTO_INCREMENT,
+                timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                username VARCHAR(120) NOT NULL,
+                action VARCHAR(255) NOT NULL,
+                old_value TEXT,
+                new_value TEXT
+            )
         """
-        CREATE TABLE IF NOT EXISTS audit_logs (
-            log_id INTEGER PRIMARY KEY AUTOINCREMENT,
-            timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
-            username TEXT NOT NULL,
-            action TEXT NOT NULL,
-            old_value TEXT DEFAULT '—',
-            new_value TEXT DEFAULT '—'
-        )
-    """
-    )
-    conn.commit()
-    conn.close()
+    else:
+        query = """
+            CREATE TABLE IF NOT EXISTS audit_logs (
+                log_id SERIAL PRIMARY KEY,
+                timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                username VARCHAR(120) NOT NULL,
+                action VARCHAR(255) NOT NULL,
+                old_value TEXT DEFAULT '—',
+                new_value TEXT DEFAULT '—'
+            )
+        """
+    try:
+        run_query(query)
+    except Exception as e:
+        print(f"Warning: could not initialize audit_logs table: {e}")
 
 
 def log_audit_action(username: str, action: str, old_val: str = "—", new_val: str = "—"):
-    """Inserts an entry into the audit_logs table."""
-    init_audit_log_table()
-    conn = sqlite3.connect(DB_FILE)
-    cursor = conn.cursor()
-    timestamp_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
-    cursor.execute(
-        """
-        INSERT INTO audit_logs (timestamp, username, action, old_value, new_value)
-        VALUES (?, ?, ?, ?, ?)
-    """,
-        (timestamp_str, username, action, str(old_val), str(new_val)),
-    )
-
-    conn.commit()
-    conn.close()
+    """Inserts an entry into the centralized audit_logs table."""
+    try:
+        init_audit_log_table()
+        run_query(
+            """INSERT INTO audit_logs (username, action, old_value, new_value)
+               VALUES (%s, %s, %s, %s)""",
+            (username, action, str(old_val), str(new_val)),
+        )
+    except Exception as e:
+        print(f"Warning: Failed to record audit log: {e}")
 
 
 def get_audit_logs_df() -> pd.DataFrame:
-    """Retrieves all audit logs ordered by timestamp descending."""
-    init_audit_log_table()
-    conn = sqlite3.connect(DB_FILE)
+    """Retrieves all audit logs ordered by timestamp descending from the central database."""
     query = """
         SELECT 
             timestamp AS "Date & Time",
@@ -1026,9 +1242,14 @@ def get_audit_logs_df() -> pd.DataFrame:
         FROM audit_logs
         ORDER BY log_id DESC
     """
-    df = pd.read_sql_query(query, conn)
-    conn.close()
-    return df
+    try:
+        init_audit_log_table()
+        df = run_query(query, fetch=True)
+        if df is not None and not df.empty:
+            return df
+    except Exception:
+        pass
+    return pd.DataFrame(columns=["Date & Time", "User", "Action", "Old Value", "New Value"])
 
 def get_payslip_config():
     """Fetches the current salary slip settings or returns default structure."""

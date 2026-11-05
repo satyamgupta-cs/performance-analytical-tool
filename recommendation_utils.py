@@ -1,4 +1,4 @@
-def analyze_performance(completed_tasks, assigned_tasks, completed_before_deadline, present_days, working_days, customer_rating):
+def analyze_performance(completed_tasks, assigned_tasks, completed_before_deadline, present_days, working_days, customer_rating, weights=None):
     """Calculates granular KPI percentages, assigns status flags, and returns targeted recommendations."""
     
     # Calculate percentages with division-by-zero protection
@@ -7,12 +7,24 @@ def analyze_performance(completed_tasks, assigned_tasks, completed_before_deadli
     attendance = (present_days / working_days * 100) if working_days else 0
     customer_sat = (customer_rating / 5.0 * 100) if customer_rating else 0
 
-    # Calculate overall weighted score (0-100 scale)
+    if weights is None:
+        try:
+            from db_utils import get_weights
+            weights = get_weights()
+        except Exception:
+            weights = {"task": 0.35, "ontime": 0.25, "satisfaction": 0.20, "attendance": 0.20}
+
+    task_w = float(weights.get("task", 0.35))
+    ontime_w = float(weights.get("ontime", 0.25))
+    att_w = float(weights.get("attendance", 0.20))
+    sat_w = float(weights.get("satisfaction", 0.20))
+
+    # Calculate overall weighted score (0-100 scale) using configured weights
     overall_score = round(
-        (task_completion * 0.35) + 
-        (ontime_delivery * 0.25) + 
-        (attendance * 0.20) + 
-        (customer_sat * 0.20), 1
+        (task_completion * task_w) + 
+        (ontime_delivery * ontime_w) + 
+        (attendance * att_w) + 
+        (customer_sat * sat_w), 1
     )
 
     # Status classification helper
